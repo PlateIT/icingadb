@@ -1,0 +1,31 @@
+FROM bit-base-images-docker-hosted.nexus.bit.admin.ch/bit/ca-bundle:latest AS certs
+FROM docker-hub.nexus.bit.admin.ch/library/golang:1 AS base
+
+COPY --from=certs /certs/ /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+FROM base AS build
+RUN --mount=target=. \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o /icingadb ./cmd/icingadb
+
+FROM scratch
+
+COPY --from=base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY ./schema/mysql/schema.sql /schema/mysql/schema.sql
+COPY ./schema/pgsql/schema.sql /schema/pgsql/schema.sql
+COPY --chmod=755 --from=build /icingadb /icingadb
+
+ENV PATH=/
+CMD ["icingadb", "--database-auto-import"]
+
+LABEL bit.image.authors="IDTR-ICD@bit.admin.ch" \
+      bit.image.vendor="BIT PS-PSC-AUI" \
+      bit.image.title="BIT icingadb image" \
+      bit.image.description="Icinga DB image built from source with BIT CA trust."
