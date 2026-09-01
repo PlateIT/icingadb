@@ -1,4 +1,5 @@
 FROM bit-base-images-docker-hosted.nexus.bit.admin.ch/bit/ca-bundle:latest AS certs
+FROM docker-hub.nexus.bit.admin.ch/library/busybox:1.37 AS tools
 FROM docker-hub.nexus.bit.admin.ch/library/golang:1 AS base
 
 COPY --from=certs /certs/ /usr/local/share/ca-certificates/
@@ -18,12 +19,12 @@ RUN --mount=target=. \
 FROM scratch
 
 COPY --from=base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY ./schema/mysql/schema.sql /schema/mysql/schema.sql
+COPY --from=tools /bin/busybox /busybox
 COPY ./schema/pgsql/schema.sql /schema/pgsql/schema.sql
 COPY --chmod=755 --from=build /icingadb /icingadb
 
 ENV PATH=/
-CMD ["icingadb", "--database-auto-import"]
+CMD ["icingadb"]
 
 LABEL bit.image.authors="IDTR-ICD@bit.admin.ch" \
       bit.image.vendor="BIT PS-PSC-AUI" \
