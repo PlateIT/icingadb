@@ -157,9 +157,8 @@ func (client *Client) ApplyDelta(ctx context.Context, delta *icingadb.Delta) err
 		}
 		client.incidentsByObjId = client.retrieveEnvironmentIncidents(ctx)
 	}()
-	if len(client.incidentsByObjId) == 0 {
-		return nil
-	}
+	// An empty incident list still requires reconciliation: current problems
+	// may predate this connection or have been rejected by an older API.
 
 	client.logger.Infof("Fetching %d entities of type %s from Redis for submission to Icinga Notifications",
 		len(delta.RedisSnapshot),
