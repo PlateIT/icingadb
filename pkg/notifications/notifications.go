@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/icinga/icinga-go-library/backoff"
 	"github.com/icinga/icinga-go-library/com"
 	"github.com/icinga/icinga-go-library/database"
@@ -456,17 +458,29 @@ func (client *Client) buildCommonEvent(
 		}
 	}
 
-	objectId := objectName + fmt.Sprintf("!%d", time.Now().UnixMilli())
+	objectUrl = client.objectURL(objectUrl)
 
 	return &fetchableEvent{
 		Event: &event.Event{
-			ID:   objectId,
+			ID:   types.MakeUUID(uuid.New()),
 			Name: objectName,
 			URL:  objectUrl,
 			Tags: objectTags,
 		},
 		relations: rel,
 	}, nil
+}
+
+// objectURL preserves installations below a URL prefix and omits links when no web URL is configured.
+func (client *Client) objectURL(path string) string {
+	if client.Icingaweb2UrlParsed == nil {
+		return ""
+	}
+	reference, err := url.Parse(strings.TrimPrefix(path, "/"))
+	if err != nil {
+		return ""
+	}
+	return client.Icingaweb2UrlParsed.ResolveReference(reference).String()
 }
 
 // errNonVolatileNonHardState is returned when a non-hard state change is attempted to be submitted for a non-volatile checkable.
