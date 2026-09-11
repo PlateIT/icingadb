@@ -578,9 +578,7 @@ func (client *Client) ApplyDelta(ctx context.Context, delta *icingadb.Delta) err
 		}
 		client.incidentsByObjId = client.retrieveEnvironmentIncidents(ctx, nc)
 	}()
-	if len(client.incidentsByObjId) == 0 {
-		return nil
-	}
+	// Current problems must also be submitted when no incidents exist yet.
 
 	client.logger.Infof("Fetching %d entities of type %s from Redis for submission to Icinga Notifications",
 		len(delta.RedisSnapshot),
