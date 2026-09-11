@@ -1,9 +1,9 @@
 module github.com/icinga/icingadb/tests
 
-go 1.25.0
+go 1.26.0
 
 require (
-	github.com/go-sql-driver/mysql v1.10.0
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/goccy/go-yaml v1.13.0
 	github.com/google/uuid v1.6.0
 	github.com/icinga/icinga-go-library v0.9.0
@@ -14,7 +14,7 @@ require (
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/zap v1.28.0
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
-	golang.org/x/sync v0.22.0
+	golang.org/x/sync v0.23.0
 )
 
 require (
