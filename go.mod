@@ -11,15 +11,15 @@ require (
 	github.com/icinga/icinga-go-library v0.9.1-0.20260908070857-97ea5267070e
 	github.com/jessevdk/go-flags v1.6.1
 	github.com/jmoiron/sqlx v1.4.0
-	github.com/mattn/go-sqlite3 v1.14.50
+	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/okzk/sdnotify v0.0.0-20180710141335-d9becc38acbd
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.12.1
 	github.com/theory/jsonpath v0.12.1
 	github.com/vbauerster/mpb/v6 v6.0.4
 	go.uber.org/zap v1.28.0
-	golang.org/x/sync v0.22.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sync v0.23.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
