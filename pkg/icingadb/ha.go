@@ -5,6 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"os"
+	"os/user"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/icinga/icinga-go-library/backoff"
 	"github.com/icinga/icinga-go-library/database"
@@ -18,13 +25,8 @@ import (
 	icingaredisv1 "github.com/icinga/icingadb/pkg/icingaredis/v1"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sys/unix"
-	"os"
-	"os/user"
-	"path/filepath"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // peerTimeout defines the timeout for HA heartbeats, being used to detect absent nodes.
@@ -45,6 +47,13 @@ type NotificationsState struct {
 
 	// The discovered Icinga Notifications listener socket path, if any.
 	socketPath types.String
+
+	// socketPathWarned indicates [HA.probeNotificationsSocketPath] already logged something at warning level.
+	// Later log messages will be degraded to debug to minimize flooding the log.
+	socketPathWarned bool
+
+	// socketPathProbedOnce indicates whether the Icinga Notifications listener socket path has been probed at least once.
+	socketPathProbedOnce bool
 
 	// lastProblemLoggedAt is the last time a problem with the Icinga Notifications component was logged.
 	// This is used to suppress recurring log messages.
@@ -74,7 +83,8 @@ type HA struct {
 	done        chan struct{}
 	errOnce     sync.Once
 	err         error
-	mu          sync.Mutex // protects environment, endpointId, and err
+	icinga2Ver  string
+	mu          sync.Mutex // protects environment, endpointId, icinga2Ver, and err
 
 	// notificationsHeartbeat is a channel that signals the status of the Icinga Notifications component.
 	//
@@ -84,6 +94,9 @@ type HA struct {
 	notificationsHeartbeatCh             chan types.Bool
 	notifications                        NotificationsState
 	notificationsSynchronizeWithDatabase types.Bool
+
+	// icinga2VersionCheck returns an error if the Icinga 2 version is too old to be used with Icinga Notifications.
+	icinga2VersionCheck func(version string) error
 }
 
 // NewHA returns a new HA and starts the controller loop.
@@ -93,6 +106,7 @@ func NewHA(
 	heartbeat *icingaredis.Heartbeat,
 	logger *logging.Logger,
 	notificationsSynchronizeWithDatabase bool,
+	icinga2VersionCheck func(version string) error,
 ) *HA {
 	ctx, cancelCtx := context.WithCancel(ctx)
 
@@ -111,6 +125,7 @@ func NewHA(
 
 		notificationsHeartbeatCh:             make(chan types.Bool),
 		notificationsSynchronizeWithDatabase: types.MakeBool(notificationsSynchronizeWithDatabase),
+		icinga2VersionCheck:                  icinga2VersionCheck,
 	}
 
 	ha.state.Store(&haState{})
@@ -151,6 +166,15 @@ func (h *HA) EndpointID() types.Binary {
 	defer h.mu.Unlock()
 
 	return h.endpointId
+}
+
+// Icinga2Version returns the Icinga 2 version from the last received heartbeat, which might be empty
+// if none was received yet.
+func (h *HA) Icinga2Version() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.icinga2Ver
 }
 
 // Err returns an error if Done has been closed and there is an error. Otherwise returns nil.
@@ -249,6 +273,7 @@ func (h *HA) controller() {
 					}
 					h.endpointId = s.EndpointId
 				}
+				h.icinga2Ver = s.Version
 				h.mu.Unlock()
 
 				envId, err := m.EnvironmentID()
@@ -656,6 +681,13 @@ func (h *HA) signalTakeover(reason string) {
 //
 // It returns true if a handover was triggered, false otherwise.
 func (h *HA) verifyNotificationsState() bool {
+	// Don't do anything if the Icinga 2 version is too old to be used with Icinga Notifications, otherwise this
+	// will cause a handover ping-pong between HA instances with Icinga 2 versions that are too old. This is just
+	// a safety check, as there should be no one reporting a heartbeat about Icinga Notifications in this case.
+	if h.icinga2VersionCheck(h.Icinga2Version()) != nil {
+		return false
+	}
+
 	now := time.Now()
 	if h.notifications.IsValidUnhealthy() && now.After(h.notifications.unhealthySince.Add(retry.DefaultTimeout)) {
 		lastLogged := h.notifications.lastProblemLoggedAt
@@ -690,7 +722,22 @@ func (h *HA) probeNotificationsSocketPath() (socketPath types.String) {
 	if h.notifications.socketPath.Valid && h.notifications.socketPath.String != "" {
 		return h.notifications.socketPath
 	}
-	defer func() { h.notifications.socketPath = socketPath }()
+
+	// Don't do anything after the first time if the Icinga 2 version is too old to be used with Icinga Notifications.
+	if h.notifications.socketPathProbedOnce && h.icinga2VersionCheck(h.Icinga2Version()) != nil {
+		return types.String{}
+	}
+
+	defer func() {
+		h.notifications.socketPath = socketPath
+		h.notifications.socketPathProbedOnce = true
+		h.notifications.socketPathWarned = true
+	}()
+
+	warnLevel := zapcore.WarnLevel
+	if h.notifications.socketPathWarned {
+		warnLevel = zapcore.DebugLevel
+	}
 
 	path := os.Getenv("ICINGA_NOTIFICATIONS_LISTENER_SOCKET")
 	if path == "" {
@@ -699,20 +746,27 @@ func (h *HA) probeNotificationsSocketPath() (socketPath types.String) {
 	}
 
 	path = filepath.Clean(path)
-	info, err := os.Stat(path)
+	info, err := os.Stat(path) // #nosec G703 -- Path comes from trusted (by def) environment variable
 	if err != nil {
-		h.logger.Warnw("Failed to stat Icinga Notifications listener socket", zap.String("path", path), zap.Error(err))
+		h.logger.Logw(warnLevel,
+			"Failed to stat Icinga Notifications listener socket",
+			zap.String("path", path),
+			zap.Error(err))
 		return types.MakeString("", types.TransformEmptyStringToNull)
 	}
 
 	if info.Mode()&os.ModeSocket == 0 {
-		h.logger.Warnw("Icinga Notifications listener socket path is not a socket", zap.String("path", path))
+		h.logger.Logw(warnLevel,
+			"Icinga Notifications listener socket path is not a socket",
+			zap.String("path", path))
 		return types.MakeString("", types.TransformEmptyStringToNull)
 	}
 
 	if err := unix.Access(path, unix.R_OK|unix.W_OK); err != nil {
-		h.logger.Warnw("Icinga DB user has no permissions to access Icinga Notifications listener socket",
-			zap.String("path", path), zap.Error(err))
+		h.logger.Logw(warnLevel,
+			"Icinga DB user has no permissions to access Icinga Notifications listener socket",
+			zap.String("path", path),
+			zap.Error(err))
 		return types.MakeString("", types.TransformEmptyStringToNull)
 	}
 

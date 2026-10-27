@@ -3,8 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
 	"github.com/icinga/icinga-go-library/logging"
 	"github.com/icinga/icinga-go-library/redis"
+	"github.com/icinga/icinga-go-library/types"
 	"github.com/icinga/icinga-go-library/utils"
 	"github.com/icinga/icingadb/internal"
 	"github.com/icinga/icingadb/internal/command"
@@ -20,12 +28,6 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"os"
-	"os/signal"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
 )
 
 const (
@@ -142,7 +144,8 @@ func run() int {
 			db,
 			heartbeat,
 			logs.GetChildLogger("high-availability"),
-			cmd.Config.Notifications.SynchronizeWithDatabase)
+			cmd.Config.Notifications.SynchronizeWithDatabase,
+			notifications.CheckIcinga2Version)
 
 		telemetryLogger := logs.GetChildLogger("telemetry")
 		telemetrySyncStats = telemetry.StartHeartbeat(ctx, rc, telemetryLogger, ha, heartbeat)
@@ -198,16 +201,18 @@ func run() int {
 		logger.Info("Starting history sync")
 
 		var extraStages map[string]history.StageFunc
-		//if notificationsSource != nil {
-		// We don't need to subscribe to the history pipelines anymore, so disabling them temporarily until
-		// someone works on implementing https://github.com/Icinga/icinga-notifications/issues/409.
-		//extraStages = notificationsSource.SyncExtraStages(ctx)
-		//}
+		if notificationsSource != nil {
+			extraStages = notificationsSource.SyncExtraStages()
+		}
 
 		if err := hs.Sync(ctx, extraStages); err != nil && !utils.IsContextCanceled(err) {
 			logger.Fatalf("%+v", err)
 		}
 	}()
+
+	// passively drain runtime update streams, safe as a takeover always starts with a full sync
+	logger.Info("Starting passive runtime updates stream clearing")
+	rt.SyncPassive(ctx, ha)
 
 	// Main loop
 	for {
@@ -236,13 +241,40 @@ func run() int {
 						stateInitSync := &sync.WaitGroup{}
 
 						// Decided once per sync round, so that everything within agrees on whether Icinga Notifications
-						// is available. Any later change of the Client cancels synctx and starts a new round.
-						notificationsConfigured := notificationsSource != nil && notificationsSource.IsConfigured()
+						// is available. Any later change of the Client cancels synctx and starts a new round unless
+						// the Icinga 2 version is too old, in which case the Client is ignored until the next round.
+						//
+						// When Icinga 2 is too old, the Notifications Client will never be marked as configured. So,
+						// the user will never be notified that their setup cannot work. Adding the static URL to the
+						// check allows raising the alarm, and directly unconfiguring the flag afterward.
+						notificationsConfigured := notificationsSource != nil &&
+							(notificationsSource.IsConfigured() || cmd.Config.Notifications.Config.Url != "")
+						if notificationsConfigured {
+							// Without a recent enough Icinga 2, Icinga DB can't submit correct events.
+							if err := notifications.CheckIcinga2Version(ha.Icinga2Version()); err != nil {
+								logger.Warnw("Cannot use Icinga Notifications with this Icinga 2 version, disabling it",
+									zap.Error(err))
+								notificationsConfigured = false
+
+								// Nothing else is going to report the component's health, so do it here. This is a
+								// state rather than an event, hence it must not be dropped.
+								select {
+								case ha.NotificationsHeartbeat() <- types.MakeBool(false):
+								case <-synctx.Done():
+								}
+							}
+						}
 
 						// Clear the runtime update streams before starting anything else (rather than after the sync),
 						// otherwise updates may be lost.
 						runtimeConfigUpdateStreams, runtimeStateUpdateStreams, err := rt.ClearStreams(synctx)
 						if err != nil {
+							cancelSynctx()
+
+							if utils.IsContextCanceled(err) {
+								continue
+							}
+
 							logger.Fatalf("%+v", err)
 						}
 
@@ -256,6 +288,10 @@ func run() int {
 						g.Go(func() error {
 							var notificationsReconfiguredCh <-chan struct{}
 							if notificationsSource != nil {
+								// With a too old Icinga 2, the database-stored configuration isn't synchronized,
+								// so no reconfiguration is signaled and the Client stays ignored for this round.
+								// We will only receive a reconfiguration signal if the Icinga 2 version changes
+								// to a new version that is recent enough to support Icinga Notifications.
 								notificationsReconfiguredCh = notificationsSource.ReconfiguredCh()
 							}
 
@@ -416,6 +452,18 @@ func run() int {
 								logger.Info("Starting Icinga Notifications periodic outputs sync")
 
 								return notificationsSource.SyncCheckOutputs(synctx)
+							})
+
+							g.Go(func() error {
+								stateInitSync.Wait()
+
+								if err := synctx.Err(); err != nil {
+									return err
+								}
+
+								logger.Info("Starting Icinga Notifications periodic alert histories sync")
+
+								return notificationsSource.SyncAlertHistories(synctx)
 							})
 						}
 

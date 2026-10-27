@@ -3,6 +3,9 @@ package icingadb
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"time"
+
 	"github.com/icinga/icinga-go-library/com"
 	"github.com/icinga/icinga-go-library/database"
 	"github.com/icinga/icinga-go-library/logging"
@@ -16,8 +19,6 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"runtime"
-	"time"
 )
 
 // Sync implements a rendezvous point for Icinga DB and Redis to synchronize their entities.
@@ -84,7 +85,7 @@ func (s Sync) Sync(ctx context.Context, subject *common.SyncSubject, hook DeltaH
 
 	desired, redisErrs := icingaredis.YieldAll(ctx, s.redis, subject)
 	// Let errors from Redis cancel our group.
-	com.ErrgroupReceive(g, redisErrs)
+	com.ErrgroupReceiveWrap(g, redisErrs, "can't yield %q from redis for sync", subject.Name())
 
 	e, ok := v1.EnvironmentFromContext(ctx)
 	if !ok {
@@ -96,7 +97,7 @@ func (s Sync) Sync(ctx context.Context, subject *common.SyncSubject, hook DeltaH
 		s.db.BuildSelectStmt(NewScopedEntity(subject.Entity(), e.Meta()), subject.Entity().Fingerprint()), e.Meta(),
 	)
 	// Let errors from DB cancel our group.
-	com.ErrgroupReceive(g, dbErrs)
+	com.ErrgroupReceiveWrap(g, dbErrs, "can't yield %q from database for sync", subject.Name())
 
 	g.Go(func() error {
 		return s.ApplyDelta(ctx, NewDelta(ctx, actual, desired, subject, s.logger), hook)
@@ -181,9 +182,35 @@ func (s Sync) ApplyDelta(ctx context.Context, delta *Delta, hook DeltaHook) erro
 	// Delete
 	if len(delta.Delete) > 0 {
 		s.logger.Infof("Deleting %d items of type %s", len(delta.Delete), strcase.Delimited(types.Name(delta.Subject.Entity()), ' '))
-		g.Go(func() error {
-			return s.db.Delete(ctx, delta.Subject.Entity(), delta.Delete.IDs(), database.OnSuccessIncrement[any](stat))
-		})
+
+		ids := delta.Delete.IDs()
+
+		// Those objects are probably removed from the configuration files, i.e., Icinga 2 won't send the
+		// corresponding end/removed events for them. So try to mark them as cancelled manually, so that
+		// they don't show up as if they were still active in the UI.
+		//
+		// This is not performed in a separate goroutine to ensure that the relevant Comment/Downtime
+		// object is not deleted before closing the history.
+
+		var err error
+		switch delta.Subject.Entity().(type) {
+		case *v1.Comment:
+			err = s.mockCommentEnd(ctx, ids)
+		case *v1.Downtime:
+			err = s.mockDowntimeEnd(ctx, ids)
+		}
+
+		if ctx.Err() == nil {
+			g.Go(func() error { return err })
+		}
+
+		// Start the deletion process only if we haven't aborted the config sync due to an error in the
+		// downtime history update above.
+		if err == nil && ctx.Err() == nil {
+			g.Go(func() error {
+				return s.db.Delete(ctx, delta.Subject.Entity(), ids, database.OnSuccessIncrement[any](stat))
+			})
+		}
 	}
 
 	return g.Wait()
@@ -201,7 +228,7 @@ func (s Sync) SyncCustomvars(ctx context.Context) error {
 	cv := common.NewSyncSubject(v1.NewCustomvar)
 
 	cvs, errs := icingaredis.YieldAll(ctx, s.redis, cv)
-	com.ErrgroupReceive(g, errs)
+	com.ErrgroupReceiveWrap(g, errs, "can't yield %q from redis for custom var sync", cv.Name())
 
 	desiredCvs, desiredFlatCvs, errs := v1.ExpandCustomvars(ctx, cvs)
 	com.ErrgroupReceive(g, errs)
@@ -210,7 +237,7 @@ func (s Sync) SyncCustomvars(ctx context.Context) error {
 		ctx, cv.FactoryForDelta(),
 		s.db.BuildSelectStmt(NewScopedEntity(cv.Entity(), e.Meta()), cv.Entity().Fingerprint()), e.Meta(),
 	)
-	com.ErrgroupReceive(g, errs)
+	com.ErrgroupReceiveWrap(g, errs, "can't yield %q from database", cv.Name())
 
 	g.Go(func() error {
 		return s.ApplyDelta(ctx, NewDelta(ctx, actualCvs, desiredCvs, cv, s.logger), nil)
@@ -222,7 +249,7 @@ func (s Sync) SyncCustomvars(ctx context.Context) error {
 		ctx, flatCv.FactoryForDelta(),
 		s.db.BuildSelectStmt(NewScopedEntity(flatCv.Entity(), e.Meta()), flatCv.Entity().Fingerprint()), e.Meta(),
 	)
-	com.ErrgroupReceive(g, errs)
+	com.ErrgroupReceiveWrap(g, errs, "can't yield %q from database for custom var sync", flatCv.Name())
 
 	g.Go(func() error {
 		return s.ApplyDelta(ctx, NewDelta(ctx, actualFlatCvs, desiredFlatCvs, flatCv, s.logger), nil)
